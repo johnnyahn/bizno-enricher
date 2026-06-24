@@ -132,8 +132,11 @@ if df_in is not None and len(df_in):
                     "중간": "background-color:#fff3cd",
                     "낮음": "background-color:#f8d7da"}.get(v, "")
 
-        st.dataframe(out.style.applymap(color, subset=["신뢰도"]),
-                     use_container_width=True, hide_index=True)
+        sty = out.style
+        # pandas 2.1+ 는 Styler.map, 이전은 applymap (Cloud 최신 버전 호환)
+        sty = (sty.map if hasattr(sty, "map") else sty.applymap)(
+            color, subset=["신뢰도"])
+        st.dataframe(sty, use_container_width=True, hide_index=True)
 
         # 다운로드(엑셀)
         buf = io.BytesIO()
