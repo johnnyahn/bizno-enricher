@@ -95,29 +95,83 @@ def _find_subpages(base_url, html, limit=3):
     return cands
 
 
-def bizno_from_homepage(homepage):
-    """홈페이지 루트 → (없으면) 회사소개/약관/개인정보 등 하위 페이지에서 사업자번호."""
-    if not homepage or not homepage.strip():
+# 홈페이지 이메일 추출 — bizno에 이메일이 없는 회사를 홈페이지로 보완
+EMAIL_RE = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
+# 회사 이메일이 아닌 흔한 잡음(예시·라이브러리·이미지·placeholder 등) 제외
+EMAIL_JUNK = ("example.", "sentry", "wix.com", "wixpress", "godaddy",
+              "yourdomain", "domain.com", "email.com", "schema.org", "w3.org",
+              "googleapis", "cloudflare", "@2x", ".png", ".jpg", ".jpeg", ".gif",
+              ".svg", "your@", "name@", "test@", "abc@", "user@", "info@example",
+              "sentry.io", "@sentry", "react", "webpack")
+
+
+def _extract_emails(html):
+    """HTML에서 이메일 후보 추출(mailto 우선). 잡음 제거 후 중복 없는 리스트."""
+    soup = BeautifulSoup(html, "html.parser")
+    found = []
+    for a in soup.find_all("a", href=True):
+        if a["href"].lower().startswith("mailto:"):
+            addr = a["href"][7:].split("?")[0].strip()
+            if addr:
+                found.append(addr)
+    for tag in soup(["script", "style"]):
+        tag.decompose()
+    found += EMAIL_RE.findall(soup.get_text(" ", strip=True))
+    out = []
+    for e in found:
+        el = e.lower().strip().strip(".")
+        if any(j in el for j in EMAIL_JUNK) or el in out:
+            continue
+        out.append(el)
+    return out
+
+
+def _pick_email(emails, homepage):
+    """후보 중 회사 대표 이메일로 가장 그럴듯한 것 선택."""
+    if not emails:
         return ""
+    dom = domain_of(homepage)
+    for e in emails:                      # 1) 홈페이지 도메인과 같은 메일 우선
+        if dom and e.endswith("@" + dom):
+            return e
+    for e in emails:                      # 2) 흔한 한국 메일 서비스
+        if any(p in e for p in ["naver.com", "gmail.com", "daum.net",
+                                "kakao.com", "hanmail.net", "nate.com"]):
+            return e
+    return emails[0]
+
+
+def scan_homepage(homepage):
+    """홈페이지(+하위 페이지)를 1회 크롤해 사업자번호와 이메일을 함께 추출.
+    반환 {'bizno': '', 'email': ''}. (사업자번호 찾으러 어차피 방문하므로 이메일도 같이)"""
+    res = {"bizno": "", "email": ""}
+    if not homepage or not homepage.strip():
+        return res
     try:
         r = _get(homepage, timeout=12)
         r.encoding = r.apparent_encoding or "utf-8"
     except Exception:
-        return ""
-    val = _extract_bizno_from_html(r.text)
-    if val:
-        return val
-    for sub in _find_subpages(r.url, r.text):
+        return res
+    res["bizno"] = _extract_bizno_from_html(r.text)
+    emails = _extract_emails(r.text)
+    if res["bizno"] and emails:           # 둘 다 루트에서 확보되면 종료
+        res["email"] = _pick_email(emails, homepage)
+        return res
+    for sub in _find_subpages(r.url, r.text):   # 부족한 것만 하위 페이지에서 보완
+        if res["bizno"] and emails:
+            break
         try:
             r2 = _get(sub, timeout=10)
             r2.encoding = r2.apparent_encoding or "utf-8"
-            val = _extract_bizno_from_html(r2.text)
-            if val:
-                return val
         except Exception:
             continue
+        if not res["bizno"]:
+            res["bizno"] = _extract_bizno_from_html(r2.text)
+        if not emails:
+            emails = _extract_emails(r2.text)
         time.sleep(0.15)
-    return ""
+    res["email"] = _pick_email(emails, homepage)
+    return res
 
 
 # ---------- 2) bizno 회사명 검색 + 식별 ----------
@@ -217,7 +271,8 @@ def bizno_detail(bizno_hyphen):
 
 # ---------- 통합: 한 회사 조회 ----------
 RESULT_FIELDS = ["사업자등록번호", "조회출처", "신뢰도", "대표자명", "회사주소",
-                 "업태", "종목", "기업규모", "회사이메일", "전화번호", "법인등록번호"]
+                 "업태", "종목", "기업규모", "회사이메일", "이메일출처",
+                 "전화번호", "법인등록번호"]
 
 
 def lookup_one(name, homepage):
@@ -229,7 +284,9 @@ def lookup_one(name, homepage):
         out["조회출처"] = "회사명없음"
         return out
 
-    biz = bizno_from_homepage(homepage) if homepage else ""
+    # 홈페이지 1회 크롤로 사업자번호 + 이메일을 함께 확보
+    scan = scan_homepage(homepage) if homepage else {"bizno": "", "email": ""}
+    biz = scan["bizno"]
     if biz:
         out["조회출처"], out["신뢰도"] = "홈페이지", "높음"
     else:
@@ -245,6 +302,13 @@ def lookup_one(name, homepage):
             out[k] = det.get(k, "")
     elif not out["조회출처"]:
         out["조회출처"] = "미발견"
+
+    # 이메일 보완: bizno에 있으면 그 값(출처 bizno), 없으면 홈페이지 추출값
+    if out["회사이메일"]:
+        out["이메일출처"] = "bizno"
+    elif scan["email"]:
+        out["회사이메일"] = scan["email"]
+        out["이메일출처"] = "홈페이지"
     return out
 
 
